@@ -7,6 +7,7 @@ Strategy: Playwright Firefox + pycookiecheat (decrypted Chrome cookies) + DOM sc
 import asyncio, json, logging, math, os, random, re, signal, sqlite3, sys, time
 from playwright.async_api import async_playwright
 import pycookiecheat
+from proxy_pool import ProxyPool, playwright_proxy
 
 # ── Config ───────────────────────────────────────────────────────
 CATEGORY_URL = "https://shopee.vn/%C4%90i%E1%BB%87n-Tho%E1%BA%A1i-Ph%E1%BB%A5-Ki%E1%BB%87n-cat.11036030"
@@ -274,11 +275,18 @@ async def main():
     started = time.time()
     total_new = total_updated = pages_ok = 0
 
-    async def new_browser_context(p):
-        """Fresh browser + context with latest cookies."""
+    proxy_pool = ProxyPool()
+    await proxy_pool.refresh()
+
+    async def new_browser_context(p, proxy_url=None):
+        """Fresh browser + context with latest cookies + optional proxy."""
         fresh_cookies = pycookiecheat.chrome_cookies('https://shopee.vn', browser='Chrome')
-        b = await p.firefox.launch(headless=False)
-        ctx = await b.new_context(locale='vi-VN', viewport={'width': 1280, 'height': 900})
+        pw_proxy = playwright_proxy(proxy_url)
+        b = await p.firefox.launch(headless=False, proxy=pw_proxy)
+        ctx = await b.new_context(
+            locale='vi-VN', viewport={'width': 1280, 'height': 900},
+            proxy=pw_proxy,
+        )
         await ctx.add_cookies([
             {'name': k, 'value': v, 'domain': '.shopee.vn', 'path': '/'}
             for k, v in fresh_cookies.items()
@@ -288,39 +296,56 @@ async def main():
         await pg.goto("https://shopee.vn", wait_until="domcontentloaded", timeout=20000)
         await human_delay(2.0, 4.0)
         await human_mouse_wiggle(pg, n=5)
-        log.info(f"  New browser context ready ({len(fresh_cookies)} cookies)")
+        proxy_info = f" via {proxy_url[:30]}" if proxy_url else ""
+        log.info(f"  New browser context ready ({len(fresh_cookies)} cookies{proxy_info})")
         return b, ctx, pg
 
     PAGES_PER_SESSION = 2  # restart browser every N pages to reset fingerprint
 
     async with async_playwright() as p:
-        browser, context, page = await new_browser_context(p)
+        current_proxy = await proxy_pool.next()
+        browser, context, page = await new_browser_context(p, current_proxy)
 
         for pagenum in range(start_page, MAX_PAGES + 1):
             if interrupted:
                 break
 
-            # Restart browser context periodically
+            # Rotate proxy + restart browser every N pages
             if pages_ok > 0 and pages_ok % PAGES_PER_SESSION == 0:
-                log.info(f"  Restarting browser context (session refresh)...")
+                log.info(f"  Rotating proxy + restarting browser context...")
                 await browser.close()
+                await proxy_pool.refresh()
+                current_proxy = await proxy_pool.next()
                 await asyncio.sleep(random.uniform(5, 10))
-                browser, context, page = await new_browser_context(p)
+                browser, context, page = await new_browser_context(p, current_proxy)
 
-            log.info(f"[Page {pagenum}/{MAX_PAGES}]")
+            log.info(f"[Page {pagenum}/{MAX_PAGES}]" + (f" proxy={current_proxy[:25]}" if current_proxy else ""))
             try:
                 products = await crawl_page(page, pagenum)
             except RuntimeError as e:
                 if "Blocked" in str(e) or "captcha" in str(e).lower() or "No items" in str(e):
-                    log.warning(f"  Blocked — restarting browser with fresh cookies...")
+                    log.warning(f"  Blocked — rotating proxy + restarting browser...")
+                    if current_proxy:
+                        proxy_pool.mark_bad(current_proxy)
                     await browser.close()
-                    await asyncio.sleep(random.uniform(10, 20))
-                    browser, context, page = await new_browser_context(p)
+                    await proxy_pool.refresh()
+                    current_proxy = await proxy_pool.next()
+                    await asyncio.sleep(random.uniform(8, 15))
+                    browser, context, page = await new_browser_context(p, current_proxy)
                     try:
                         products = await crawl_page(page, pagenum)
                     except Exception as e2:
-                        log.error(f"  Still blocked after restart: {e2}")
-                        break
+                        log.error(f"  Still blocked after proxy rotate: {e2}")
+                        # Try one more proxy
+                        if current_proxy:
+                            proxy_pool.mark_bad(current_proxy)
+                        current_proxy = await proxy_pool.next()
+                        if current_proxy != (await proxy_pool.next()):
+                            log.info("  Trying another proxy...")
+                            await browser.close()
+                            browser, context, page = await new_browser_context(p, current_proxy)
+                        else:
+                            break
                 else:
                     log.error(f"  Error: {e}")
                     break
